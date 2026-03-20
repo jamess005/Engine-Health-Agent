@@ -26,9 +26,10 @@ _PROJECT_ROOT = os.path.dirname(
 )
 sys.path.insert(0, _PROJECT_ROOT)
 
-os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
-
 warnings.filterwarnings("ignore")
+
+from src.core.logging_config import configure_logging  # noqa: E402
+configure_logging()
 
 
 # -- Pretty printing --------------------------------------------------------
@@ -369,30 +370,34 @@ def _display_journeys(journeys: list, mae: float) -> None:
             print(f"        Final RUL: ≈{final_rul:.0f}")
 
 
-def display_drift_report(data: dict) -> None:
-    """Print PSI drift report."""
+def _print_drift_section(data: dict, title: str) -> None:
+    """Print one PSI section (sensor or prediction drift)."""
     from src.models.what_if import prettify_sensors
 
+    section(title)
+
     if data.get("error"):
-        err(data["error"])
+        warn(data["error"])
         return
 
-    banner("Sensor Drift Report — NASA CMAPSS FD004")
     ts = data.get("timestamp", "")[:19].replace("T", " ")
     total = data.get("features_checked", 0)
     sig = data.get("significant_drift", 0)
     mod = data.get("moderate_drift", 0)
     ok_n = data.get("no_drift", 0)
 
-    print(f"\n  {DIM}Computed: {ts} | {total} features checked{RESET}")
+    if ts:
+        print(f"\n  {DIM}Computed: {ts} | {total} features checked{RESET}")
+    else:
+        print(f"\n  {DIM}{total} features checked{RESET}")
     print(f"\n  {GREEN}✓ No drift{RESET}       : {ok_n} features  (PSI < 0.10)")
     print(f"  {YELLOW}⚠ Moderate drift{RESET} : {mod} features  (PSI 0.10–0.25)")
     print(f"  {RED}✗ Significant{RESET}    : {sig} features  (PSI > 0.25)")
 
     details = data.get("details", [])
     if details:
-        print(f"\n  {'Feature':<14} {'PSI':>7}  {'Status'}")
-        print(f"  {'-'*40}")
+        print(f"\n  {'Feature':<18} {'PSI':>7}  {'Status'}")
+        print(f"  {'-'*44}")
         for row in details:
             feat = row.get("feature", "")
             psi = row.get("psi_score", 0.0)
@@ -404,7 +409,7 @@ def display_drift_report(data: dict) -> None:
                 colour, symbol = YELLOW, "⚠"
             else:
                 colour, symbol = GREEN, "✓"
-            print(f"  {label:<14} {psi:>7.4f}  {colour}{symbol} {level}{RESET}")
+            print(f"  {label:<18} {psi:>7.4f}  {colour}{symbol} {level}{RESET}")
 
     if sig > 0:
         flagged = ", ".join(data.get("flagged", [])[:5])
@@ -416,8 +421,29 @@ def display_drift_report(data: dict) -> None:
     else:
         print(f"\n  {GREEN}All features within normal distribution range.{RESET}")
 
-    print(f"\n  {DIM}PSI algorithm: Population Stability Index")
-    print(f"  Baseline: FD004 training set | Current: FD004 test set{RESET}")
+
+def display_drift_report(data: dict) -> None:
+    """Print full drift report (input sensors + output predictions)."""
+    if data.get("error"):
+        err(data["error"])
+        return
+
+    # Support both old flat format and new {input_drift, output_drift} format
+    if "input_drift" in data or "output_drift" in data:
+        banner("Drift Report — NASA CMAPSS FD004")
+        print(f"\n  {DIM}PSI algorithm: Population Stability Index{RESET}")
+        print(f"  {DIM}Baseline: FD004 training set | Current: FD004 test set{RESET}\n")
+        if "input_drift" in data:
+            _print_drift_section(data["input_drift"], "Input (Sensor) Drift")
+        if "output_drift" in data:
+            _print_drift_section(data["output_drift"], "Output (Prediction) Drift")
+    else:
+        # Legacy flat format
+        banner("Sensor Drift Report — NASA CMAPSS FD004")
+        print(f"\n  {DIM}PSI algorithm: Population Stability Index")
+        print(f"  Baseline: FD004 training set | Current: FD004 test set{RESET}")
+        _print_drift_section(data, "Sensor Features")
+
     print(f"{'=' * W}\n")
 
 
@@ -641,9 +667,9 @@ def interactive_mode() -> None:
             continue
 
         if low == "drift":
-            from src.drift.drift_monitor import run_drift_check
-            print(f"  {DIM}Computing PSI drift check ...{RESET}")
-            display_drift_report(run_drift_check())
+            from src.drift.drift_monitor import run_full_drift_check
+            print(f"  {DIM}Computing drift check ...{RESET}")
+            display_drift_report(run_full_drift_check())
             continue
 
         if low == "demo":
@@ -713,9 +739,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.drift:
-        from src.drift.drift_monitor import run_drift_check
-        print(f"  {DIM}Computing PSI drift check ...{RESET}")
-        display_drift_report(run_drift_check())
+        from src.drift.drift_monitor import run_full_drift_check
+        print(f"  {DIM}Computing drift check ...{RESET}")
+        display_drift_report(run_full_drift_check())
         return
 
     if args.fleet:

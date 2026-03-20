@@ -1,15 +1,16 @@
 """SQLite database for Engine Health Agent.
 
 Stores prediction history, agent run logs, drift metrics, raw sensor data,
-processed features, and ground-truth RUL labels.
+processed features, ground-truth RUL labels, and async API job results.
 
 Tables:
-    predictions       — per-engine RUL inference log
-    agent_runs        — full agent execution history (replaces agent_runs.jsonl)
-    drift_metrics     — PSI drift check snapshots
-    raw_sensor_data   — CMAPSS raw txt data (unit/cycle/op1-3/s1-21)
+    predictions        — per-engine RUL inference log
+    agent_runs         — full agent execution history
+    drift_metrics      — PSI drift check snapshots
+    raw_sensor_data    — CMAPSS raw txt data (unit/cycle/op1-3/s1-21)
     processed_features — condition-normalised features from processed parquet files
-    rul_labels        — ground-truth RUL per test engine from RUL_FD004.txt
+    rul_labels         — ground-truth RUL per test engine from RUL_FD004.txt
+    async_jobs         — async API query results (replaces in-memory dict)
 """
 
 from __future__ import annotations
@@ -20,6 +21,11 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+
+# Load .env before any os.getenv calls — safe no-op if file absent
+load_dotenv()
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -104,6 +110,15 @@ def init_db() -> None:
                 engine_id INTEGER NOT NULL,
                 rul_true  INTEGER NOT NULL,
                 UNIQUE(dataset, engine_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS async_jobs (
+                job_id    TEXT PRIMARY KEY,
+                status    TEXT NOT NULL,
+                engine_id INTEGER,
+                result    TEXT,
+                created   TEXT NOT NULL,
+                updated   TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_pred_engine ON predictions(engine_id);
@@ -427,6 +442,62 @@ def get_rul_labels(fd_id: str = "FD004") -> Dict[int, int]:
     ).fetchall()
     conn.close()
     return {r["engine_id"]: r["rul_true"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Async job store (API job persistence)
+# ---------------------------------------------------------------------------
+
+def create_job(job_id: str, engine_id: Optional[int]) -> None:
+    """Insert a new async job row with status='queued'."""
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        conn = get_db()
+        with conn:
+            conn.execute(
+                "INSERT INTO async_jobs (job_id, status, engine_id, result, created, updated)"
+                " VALUES (?, 'queued', ?, NULL, ?, ?)",
+                (job_id, engine_id, ts, ts),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def update_job(job_id: str, status: str, result: Optional[Dict[str, Any]] = None) -> None:
+    """Update status and optionally store the result JSON."""
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        conn = get_db()
+        with conn:
+            conn.execute(
+                "UPDATE async_jobs SET status=?, result=?, updated=? WHERE job_id=?",
+                (status, json.dumps(result) if result is not None else None, ts, job_id),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Return the async_jobs row for job_id, or None if not found."""
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM async_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        d = dict(row)
+        if d.get("result"):
+            try:
+                d["result"] = json.loads(d["result"])
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return d
+    except Exception:
+        return None
 
 
 # Initialise on import

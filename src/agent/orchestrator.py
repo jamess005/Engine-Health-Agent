@@ -20,15 +20,11 @@ import re
 import time
 import warnings
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.tools import tool as langchain_tool
 
-os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
 warnings.filterwarnings("ignore")
-
-_ROOT = Path(__file__).resolve().parents[2]
 
 MAX_STEPS = 8
 
@@ -967,11 +963,4 @@ class AgentOrchestrator:
             from src.db.database import log_agent_run
             log_agent_run(result)
         except Exception:
-            # Fallback: write to jsonl if DB unavailable
-            try:
-                runs_fp = _ROOT / "outputs" / "agent_runs.jsonl"
-                runs_fp.parent.mkdir(parents=True, exist_ok=True)
-                with open(runs_fp, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(result, default=str) + "\n")
-            except OSError:
-                pass
+            pass

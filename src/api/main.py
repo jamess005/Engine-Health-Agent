@@ -4,7 +4,7 @@ Endpoints:
     POST /agent/query         — async agent query; returns job_id immediately
     GET  /agent/result/{id}   — poll for agent result
     POST /predict/rul         — synchronous single-engine RUL prediction
-    GET  /engine/{id}/history — prediction history from agent_runs.jsonl
+    GET  /engine/{id}/history — prediction history from agent_runs DB table
     GET  /health              — liveness check
 
 Run with:
@@ -14,19 +14,19 @@ Run with:
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 import warnings
-from pathlib import Path
 from typing import Dict, List, Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-warnings.filterwarnings("ignore")
+from src.core.logging_config import configure_logging
 
-_ROOT    = Path(__file__).resolve().parents[2]
-_RUNS_FP = _ROOT / "outputs" / "agent_runs.jsonl"
+load_dotenv()
+configure_logging()
+warnings.filterwarnings("ignore")
 
 app = FastAPI(
     title="Engine Health API",
@@ -34,18 +34,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# ---------------------------------------------------------------------------
-# In-memory job store (no DB needed in this phase)
-# ---------------------------------------------------------------------------
-
-_jobs: Dict[str, Dict] = {}
-
 
 # ---------------------------------------------------------------------------
 # Lazy model singletons
 # ---------------------------------------------------------------------------
 
 _reg = None
+
 
 def _get_reg():
     global _reg
@@ -101,17 +96,16 @@ class RULResponse(BaseModel):
 
 def _run_agent(job_id: str, engine_id: int, query_text: str) -> None:
     """Synchronous wrapper called in a thread pool executor."""
-    _jobs[job_id]["status"] = "running"
+    from src.db.database import update_job
+    update_job(job_id, "running")
     try:
         from src.agent.orchestrator import AgentOrchestrator
         agent = AgentOrchestrator()
         result = agent.run(engine_id=engine_id, query_text=query_text)
-        _jobs[job_id].update({
-            "status": "done" if result.get("error") is None else "error",
-            **result,
-        })
+        status = "done" if result.get("error") is None else "error"
+        update_job(job_id, status, result)
     except Exception as exc:
-        _jobs[job_id].update({"status": "error", "error": str(exc)})
+        update_job(job_id, "error", {"error": str(exc)})
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +120,13 @@ def health():
 
 @app.post("/agent/query", response_model=AgentQueryResponse, status_code=202)
 async def agent_query(req: AgentQueryRequest):
-    """Submit an engine health query to the LLM agent.
+    """Submit an engine health query to the agent.
 
     Returns a ``job_id`` immediately.  Poll ``GET /agent/result/{job_id}`` for the result.
     """
+    from src.db.database import create_job
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {
-        "status": "queued",
-        "engine_id": req.engine_id,
-        "query": req.query_text,
-    }
+    create_job(job_id, req.engine_id)
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, _run_agent, job_id, req.engine_id, req.query_text)
     return AgentQueryResponse(job_id=job_id)
@@ -144,19 +135,21 @@ async def agent_query(req: AgentQueryRequest):
 @app.get("/agent/result/{job_id}", response_model=AgentResultResponse)
 def agent_result(job_id: str):
     """Poll for the result of a previously submitted agent query."""
-    if job_id not in _jobs:
+    from src.db.database import get_job
+    job = get_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found.")
-    job = _jobs[job_id]
+    result = job.get("result") or {}
     return AgentResultResponse(
         job_id=job_id,
         status=job["status"],
         engine_id=job.get("engine_id"),
-        query=job.get("query"),
-        recommendation=job.get("recommendation"),
-        tool_calls=job.get("tool_calls"),
-        turns=job.get("turns"),
-        latency_ms=job.get("latency_ms"),
-        error=job.get("error"),
+        query=result.get("query"),
+        recommendation=result.get("recommendation"),
+        tool_calls=result.get("tool_calls"),
+        turns=result.get("turns"),
+        latency_ms=result.get("latency_ms"),
+        error=result.get("error"),
     )
 
 
@@ -175,16 +168,17 @@ def predict_rul(req: RULRequest):
 
 @app.get("/engine/{engine_id}/history")
 def engine_history(engine_id: int):
-    """Return all agent-run records for the given engine (from agent_runs.jsonl)."""
-    if not _RUNS_FP.exists():
-        return {"engine_id": engine_id, "runs": []}
-    runs = []
-    with open(_RUNS_FP, encoding="utf-8") as f:
-        for line in f:
-            try:
-                record = json.loads(line)
-                if record.get("engine_id") == engine_id:
-                    runs.append(record)
-            except json.JSONDecodeError:
-                continue
-    return {"engine_id": engine_id, "runs": runs, "count": len(runs)}
+    """Return all agent-run records for the given engine from the DB."""
+    from src.db.database import get_db
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT timestamp, query, recommendation, turns, latency_ms, error "
+        "FROM agent_runs WHERE engine_id=? ORDER BY id DESC LIMIT 100",
+        (engine_id,),
+    ).fetchall()
+    conn.close()
+    return {
+        "engine_id": engine_id,
+        "runs": [dict(r) for r in rows],
+        "count": len(rows),
+    }

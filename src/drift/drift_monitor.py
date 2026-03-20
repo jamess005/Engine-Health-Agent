@@ -10,8 +10,8 @@ PSI thresholds:
 
 Usage::
 
-    from src.drift.drift_monitor import run_drift_check
-    summary = run_drift_check()  # computes PSI, stores to DB, returns summary
+    from src.drift.drift_monitor import run_full_drift_check
+    summary = run_full_drift_check()  # computes PSI for inputs + predictions, stores to DB
 
     from src.drift.drift_monitor import get_drift_summary
     summary = get_drift_summary()  # returns latest stored results (no recompute)
@@ -19,12 +19,15 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 import warnings
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 warnings.filterwarnings("ignore")
+
+logger = logging.getLogger(__name__)
 
 # PSI thresholds
 _PSI_MODERATE = 0.10
@@ -54,6 +57,8 @@ def compute_psi(baseline: np.ndarray, current: np.ndarray, bins: int = 10) -> fl
     baseline = baseline[np.isfinite(baseline)]
     current = current[np.isfinite(current)]
     if len(baseline) == 0 or len(current) == 0:
+        logger.warning("PSI skipped — empty data after NaN/inf removal (baseline=%d, current=%d)",
+                       len(baseline), len(current))
         return 0.0
 
     # Shared bin edges from combined range
@@ -84,8 +89,7 @@ def _drift_level(psi: float) -> str:
 def run_drift_check(fd_id: str = "FD004") -> Dict[str, Any]:
     """Compute PSI for all monitored sensor features and store results to DB.
 
-    Compares the test fleet distribution (data/processed/{fd_id}_test.parquet)
-    against the training baseline (data/processed/{fd_id}_train.parquet).
+    Compares the test fleet distribution against the training baseline.
 
     Args:
         fd_id: Dataset identifier (default 'FD004').
@@ -135,6 +139,19 @@ def run_drift_check(fd_id: str = "FD004") -> Dict[str, Any]:
     for r in rows:
         counts[r["drift_level"]] += 1
 
+    if counts["significant"] > 0:
+        sig_features = ", ".join(r["feature"] for r in rows if r["drift_level"] == "significant")
+        logger.warning(
+            "SIGNIFICANT sensor drift detected in: %s — model accuracy may be degraded",
+            sig_features,
+        )
+    elif counts["moderate"] > 0:
+        logger.info("Moderate sensor drift detected in %d features — monitor closely",
+                    counts["moderate"])
+    else:
+        logger.info("Sensor drift check complete — all %d features within normal range",
+                    len(rows))
+
     return {
         "features_checked": len(rows),
         "no_drift":         counts["none"],
@@ -143,6 +160,80 @@ def run_drift_check(fd_id: str = "FD004") -> Dict[str, Any]:
         "flagged":          flagged,
         "details":          sorted(rows, key=lambda r: -r["psi_score"]),
     }
+
+
+def run_output_drift_check(baseline_n: int = 50, recent_n: int = 50) -> Dict[str, Any]:
+    """Monitor drift in the RUL prediction distribution.
+
+    Compares the oldest ``baseline_n`` predictions in the DB against the most
+    recent ``recent_n`` using PSI.  Returns an error dict if insufficient
+    prediction history is available.
+
+    Args:
+        baseline_n: Number of oldest predictions to use as the reference.
+        recent_n:   Number of most recent predictions to compare against.
+
+    Returns:
+        Dict with feature, psi_score, drift_level, n_baseline, n_recent,
+        or an 'error' key if there is insufficient data.
+    """
+    from src.db.database import get_predictions, log_drift_metrics
+
+    rows = get_predictions(limit=baseline_n + recent_n)
+    if len(rows) < baseline_n + recent_n:
+        msg = f"Need at least {baseline_n + recent_n} predictions; have {len(rows)}"
+        logger.info("Output drift check skipped — %s", msg)
+        return {"error": msg}
+
+    # get_predictions returns newest-first (ORDER BY id DESC)
+    recent_ruls   = np.array([r["rul"] for r in rows[:recent_n]])
+    baseline_ruls = np.array([r["rul"] for r in rows[recent_n:]])
+
+    psi = compute_psi(baseline_ruls, recent_ruls)
+    level = _drift_level(psi)
+
+    metric = {
+        "feature":    "rul_predicted",
+        "condition":  None,
+        "n_test":     recent_n,
+        "mean_test":  float(recent_ruls.mean()),
+        "std_test":   float(recent_ruls.std()),
+        "mean_train": float(baseline_ruls.mean()),
+        "std_train":  float(baseline_ruls.std()),
+        "psi_score":  psi,
+        "drift_level": level,
+    }
+    log_drift_metrics([metric])
+
+    if level == "significant":
+        logger.warning(
+            "SIGNIFICANT output drift detected (RUL predictions): PSI=%.4f — "
+            "investigate data pipeline or model decay", psi,
+        )
+    elif level == "moderate":
+        logger.info("Moderate output drift detected (RUL predictions): PSI=%.4f", psi)
+
+    return {
+        "feature":    "rul_predicted",
+        "psi_score":  psi,
+        "drift_level": level,
+        "n_baseline": baseline_n,
+        "n_recent":   recent_n,
+    }
+
+
+def run_full_drift_check(fd_id: str = "FD004") -> Dict[str, Any]:
+    """Run both input (sensor) and output (prediction) drift checks.
+
+    Args:
+        fd_id: Dataset identifier (default 'FD004').
+
+    Returns:
+        Dict with 'input_drift' and 'output_drift' sections.
+    """
+    input_result  = run_drift_check(fd_id)
+    output_result = run_output_drift_check()
+    return {"input_drift": input_result, "output_drift": output_result}
 
 
 def get_drift_summary() -> Optional[Dict[str, Any]]:

@@ -82,18 +82,42 @@ def _get_train_feat():
 
 
 def _get_true_rul():
-    """Load ground-truth RUL for FD004 test engines (cached).
-
-    Returns a dict mapping engine_id (1-indexed) to true remaining useful life
-    from data/raw/RUL_FD004.txt.  Avoids the RUL_CAP=130 clip that affects
-    model predictions.
-    """
+    """Load ground-truth RUL for FD004 test engines (cached via DB)."""
     global _true_rul
     if _true_rul is None:
-        from src.features.loader import load_rul_labels
-        series = load_rul_labels("FD004")
-        _true_rul = {int(i + 1): int(v) for i, v in enumerate(series)}
+        from src.db.database import get_rul_labels
+        _true_rul = get_rul_labels("FD004")
     return _true_rul
+
+
+# ---------------------------------------------------------------------------
+# Input validation helpers
+# ---------------------------------------------------------------------------
+
+_TEST_ENGINE_MAX = 248   # FD004 test set has 248 engines
+_CONDITION_MAX   = 5     # 6 clusters: 0–5
+
+
+def _validate_engine_id(engine_id: int) -> None:
+    if not isinstance(engine_id, int) or not (1 <= engine_id <= _TEST_ENGINE_MAX):
+        raise ValueError(
+            f"engine_id must be 1–{_TEST_ENGINE_MAX}, got {engine_id!r}"
+        )
+
+
+def _validate_condition(condition: int) -> None:
+    if not isinstance(condition, int) or not (0 <= condition <= _CONDITION_MAX):
+        raise ValueError(
+            f"condition must be 0–{_CONDITION_MAX}, got {condition!r}"
+        )
+
+
+def _validate_cycles(n: int, name: str = "cycles",
+                     min_val: int = 1, max_val: int = 500) -> None:
+    if not isinstance(n, int) or not (min_val <= n <= max_val):
+        raise ValueError(
+            f"{name} must be {min_val}–{max_val}, got {n!r}"
+        )
 
 
 def _get_engine(engine_id: int):
@@ -131,6 +155,7 @@ def estimate_rul(engine_id: int) -> Dict:
         accuracy: Model accuracy metrics for this RUL range (rmse, mae, bias).
         rul_true: Ground-truth RUL if available (test set only), else null.
     """
+    _validate_engine_id(engine_id)
     from src.features.windows import make_inference_window
     from src.models.what_if import get_model_accuracy
     reg = _get_reg()
@@ -174,6 +199,8 @@ def detect_anomaly(engine_id: int, last_n_cycles: int = 20) -> Dict:
         condition_cluster: Dominant operating condition in the analysis window.
         current_cycle: Most recent observed cycle.
     """
+    _validate_engine_id(engine_id)
+    _validate_cycles(last_n_cycles, "last_n_cycles", min_val=1, max_val=200)
     det = _get_det()
     eng = _get_engine(engine_id)
     result = det.detect_latest(eng, last_n=last_n_cycles)
@@ -198,6 +225,7 @@ def compute_degradation_rate(engine_id: int) -> Dict:
         fleet_slopes: Fleet median slopes at this lifecycle stage.
         lifecycle_bin: Lifecycle fraction bin (0–9, where 9 = near end of life).
     """
+    _validate_engine_id(engine_id)
     deg = _get_deg()
     eng = _get_engine(engine_id)
     return deg.compute(eng)
@@ -220,6 +248,7 @@ def get_stress_profile(engine_id: int) -> Dict:
         dominant_condition: Most frequent condition cluster.
         stress_category: 'low' | 'moderate' | 'high'
     """
+    _validate_engine_id(engine_id)
     eng = _get_engine(engine_id)
     if "condition" not in eng.columns:
         return {"error": "condition column not available"}
@@ -269,6 +298,9 @@ def recommend_route(engine_id: int, proposed_cycles: int, condition: int) -> Dic
         recommendation: Plain-text operational recommendation.
         stress_factor: Relative stress of the proposed condition vs fleet average.
     """
+    _validate_engine_id(engine_id)
+    _validate_condition(condition)
+    _validate_cycles(proposed_cycles, "proposed_cycles")
     from src.models.what_if import project_rul
     reg = _get_reg()
     eng = _get_engine(engine_id)
@@ -294,6 +326,7 @@ def schedule_maintenance(engine_id: int) -> Dict:
         suggested_within_cycles: Recommended action window in cycles.
         reasoning: Explanation of the urgency classification.
     """
+    _validate_engine_id(engine_id)
     from src.features.windows import make_inference_window
     reg = _get_reg()
     eng = _get_engine(engine_id)
@@ -369,6 +402,10 @@ def find_replacement_engine(
         total_searched: Number of engines evaluated.
         total_qualifying: Number meeting all criteria.
     """
+    if not isinstance(min_rul, (int, float)) or not (0 <= min_rul <= 200):
+        raise ValueError(f"min_rul must be 0–200, got {min_rul!r}")
+    if not isinstance(max_results, int) or not (1 <= max_results <= 20):
+        raise ValueError(f"max_results must be 1–20, got {max_results!r}")
     from src.models.what_if import CONDITION_LABELS
 
     true_ruls = _get_true_rul()
@@ -461,6 +498,7 @@ def diagnose_engine(engine_id: int) -> Dict:
         summary: Plain-English diagnosis.
         recommended_actions: List of actionable steps.
     """
+    _validate_engine_id(engine_id)
     from src.models.diagnosis import diagnose
 
     eng = _get_engine(engine_id)
@@ -493,6 +531,8 @@ def compare_conditions(engine_id: int, cycles: int = 20) -> Dict:
         worst_condition: The condition that consumes the most RUL.
         spread: Difference in RUL between best and worst condition.
     """
+    _validate_engine_id(engine_id)
+    _validate_cycles(cycles, "cycles", min_val=1, max_val=200)
     from src.models.what_if import project_rul, CONDITION_LABELS, CONDITION_SEVERITY
     from src.models.what_if import RUL_SOFT_FLOOR, RUL_HARD_FLOOR
 
@@ -589,6 +629,8 @@ def find_best_engine_for_mission(
         total_evaluated: Engines tested.
         total_suitable: Engines meeting the min_post_mission_rul threshold.
     """
+    _validate_condition(mission_condition)
+    _validate_cycles(mission_cycles, "mission_cycles")
     from src.models.what_if import project_rul
     from src.features.windows import make_inference_window
 
@@ -684,6 +726,7 @@ def forecast_journey(engine_id: int, legs: str) -> Dict:
         safe: True if final RUL > maintenance threshold (10).
         recommendation: Plain-text assessment.
     """
+    _validate_engine_id(engine_id)
     import json as _json
     from src.models.what_if import project_journey
 
@@ -695,6 +738,10 @@ def forecast_journey(engine_id: int, legs: str) -> Dict:
         parsed_legs = _json.loads(legs)
     except (ValueError, TypeError) as exc:
         return {"error": f"Could not parse legs JSON: {exc}"}
+
+    for leg in parsed_legs:
+        _validate_condition(int(leg.get("condition", -1)))
+        _validate_cycles(int(leg.get("cycles", 0)), "leg cycles")
 
     return project_journey(eng, parsed_legs, regressor=reg,
                            rate_multiplier=rate)
