@@ -494,7 +494,7 @@ def _build_recommendation(
                 diag_data.get("primary_cause", ""))
             risk = diag_data.get("risk_level", "")
             if cause:
-                lines.append(f"\nROOT CAUSE")
+                lines.append("\nROOT CAUSE")
                 lines.append(f"{cause} ({risk} risk).")
                 findings = diag_data.get("sensor_findings", [])
                 shown = 0
@@ -524,7 +524,7 @@ def _build_recommendation(
                 "compatible" if c.get("condition_match")
                 else "different operating profile"
             )
-            lines.append(f"\nREPLACEMENT")
+            lines.append("\nREPLACEMENT")
             lines.append(
                 f"Engine {c['engine_id']} "
                 f"(RUL {c['predicted_rul']:.0f}, {label} — "
@@ -659,7 +659,7 @@ def _build_recommendation(
                 unsafe_conds.append(label)
 
         if safe_conds:
-            cond_strs = [f"{l} ({c:.2f}/flight)" for l, c in safe_conds]
+            cond_strs = [f"{lbl} ({c:.2f}/flight)" for lbl, c in safe_conds]
             lines.append(f"\nCleared for: {', '.join(cond_strs)}.")
         if unsafe_conds:
             lines.append(
@@ -679,7 +679,7 @@ def _build_recommendation(
                 cause = prettify_sensors(
                     diag_data.get("primary_cause", ""))
             if cause:
-                lines.append(f"\nDEGRADATION CONCERN")
+                lines.append("\nDEGRADATION CONCERN")
                 lines.append(
                     f"Degrading {pct:.0f}% faster than fleet "
                     f"average — {cause}."
@@ -710,7 +710,7 @@ def _build_recommendation(
 
             if urg == "IMMEDIATE" and (dominant_safe or any_safe):
                 # Don't say "ground" when the engine can still fly safely
-                lines.append(f"\nMAINTENANCE: HIGH")
+                lines.append("\nMAINTENANCE: HIGH")
                 lines.append(
                     f"Service required within {within} flights. "
                     f"Engine can continue at cleared conditions "

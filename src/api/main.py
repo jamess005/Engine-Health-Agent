@@ -16,15 +16,14 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-
 import warnings
-warnings.filterwarnings("ignore")
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+warnings.filterwarnings("ignore")
 
 _ROOT    = Path(__file__).resolve().parents[2]
 _RUNS_FP = _ROOT / "outputs" / "agent_runs.jsonl"

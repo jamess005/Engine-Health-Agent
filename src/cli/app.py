@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import textwrap
+import warnings
 from typing import Optional
 
 # Ensure project root is on the path
@@ -26,8 +27,6 @@ _PROJECT_ROOT = os.path.dirname(
 sys.path.insert(0, _PROJECT_ROOT)
 
 os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
-
-import warnings
 
 warnings.filterwarnings("ignore")
 
@@ -198,15 +197,15 @@ def _display_structured(result: dict) -> None:
         print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
         print(f"    {RED}✗ GROUNDED{RESET} — RUL {rul:.1f}. "
               f"High risk of engine failure.")
-        print(f"    No flights permitted. Remove from service "
-              f"for immediate maintenance.")
+        print("    No flights permitted. Remove from service "
+              "for immediate maintenance.")
     elif rul <= 10:
         # NOT ADVISED — within advisory limit
         print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
         print(f"    {YELLOW}⚠ NOT ADVISED{RESET} — RUL {rul:.1f}. "
               f"Approaching end of serviceable life.")
-        print(f"    Flights not recommended without "
-              f"operational necessity. Schedule maintenance now.")
+        print("    Flights not recommended without "
+              "operational necessity. Schedule maintenance now.")
         if journeys:
             _display_journeys(journeys, mae)
     elif rul <= 50:
@@ -593,7 +592,7 @@ def interactive_mode() -> None:
             for d in DEMOS:
                 print(f"    [{d['id']}] {d['title']}")
             try:
-                did = input(f"\n  Demo number: ").strip()
+                did = input("\n  Demo number: ").strip()
                 run_demo(agent, int(did))
             except (ValueError, EOFError, KeyboardInterrupt):
                 err("Enter a demo number.")

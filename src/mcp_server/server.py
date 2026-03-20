@@ -20,9 +20,9 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-warnings.filterwarnings("ignore")
-
 from fastmcp import FastMCP
+
+warnings.filterwarnings("ignore")
 
 _ROOT = Path(__file__).resolve().parents[2]
 
