@@ -1,12 +1,15 @@
 """SQLite database for Engine Health Agent.
 
-Stores prediction history, agent run logs, drift metrics, and raw sensor data.
+Stores prediction history, agent run logs, drift metrics, raw sensor data,
+processed features, and ground-truth RUL labels.
 
 Tables:
-    predictions    — per-engine RUL inference log
-    agent_runs     — full agent execution history (replaces outputs/agent_runs.jsonl)
-    drift_metrics  — PSI drift check snapshots
-    raw_sensor_data — CMAPSS txt data imported once on first run
+    predictions       — per-engine RUL inference log
+    agent_runs        — full agent execution history (replaces agent_runs.jsonl)
+    drift_metrics     — PSI drift check snapshots
+    raw_sensor_data   — CMAPSS raw txt data (unit/cycle/op1-3/s1-21)
+    processed_features — condition-normalised features from processed parquet files
+    rul_labels        — ground-truth RUL per test engine from RUL_FD004.txt
 """
 
 from __future__ import annotations
@@ -20,7 +23,6 @@ from typing import Any, Dict, List, Optional
 
 _ROOT = Path(__file__).resolve().parents[2]
 
-# Resolve DB path from env, defaulting to data/engine_health.db
 _DB_PATH: Optional[Path] = None
 
 
@@ -43,7 +45,7 @@ def get_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create all tables if they don't exist and run the raw-data migration."""
+    """Create all tables if they don't exist and run data migrations."""
     conn = get_db()
     with conn:
         conn.executescript("""
@@ -96,34 +98,205 @@ def init_db() -> None:
                 s15 REAL, s16 REAL, s17 REAL, s18 REAL, s19 REAL, s20 REAL, s21 REAL
             );
 
+            CREATE TABLE IF NOT EXISTS rul_labels (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                dataset   TEXT    NOT NULL,
+                engine_id INTEGER NOT NULL,
+                rul_true  INTEGER NOT NULL,
+                UNIQUE(dataset, engine_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_pred_engine ON predictions(engine_id);
             CREATE INDEX IF NOT EXISTS idx_runs_engine ON agent_runs(engine_id);
             CREATE INDEX IF NOT EXISTS idx_drift_ts    ON drift_metrics(timestamp);
             CREATE INDEX IF NOT EXISTS idx_raw_unit    ON raw_sensor_data(dataset, split, unit);
+            CREATE INDEX IF NOT EXISTS idx_rul_dataset ON rul_labels(dataset, engine_id);
         """)
     conn.close()
 
-    # Auto-migrate raw data on first run
+    # processed_features schema is derived from the parquet file at migration time
+    # (too many columns to hardcode; pandas to_sql creates it automatically)
+
     _auto_migrate()
 
 
-def _auto_migrate() -> None:
-    """Import raw CMAPSS txt files into raw_sensor_data if table is empty."""
-    conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM raw_sensor_data").fetchone()[0]
-    conn.close()
-    if count > 0:
-        return  # already imported
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
 
-    for fd_id in ("FD004",):
+
+def _auto_migrate() -> None:
+    """Run any outstanding data migrations (idempotent — checks row counts first)."""
+    conn = get_db()
+
+    raw_count  = conn.execute("SELECT COUNT(*) FROM raw_sensor_data").fetchone()[0]
+    rul_count  = conn.execute("SELECT COUNT(*) FROM rul_labels").fetchone()[0]
+    runs_count = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+
+    feat_count = 0
+    if _table_exists(conn, "processed_features"):
+        feat_count = conn.execute("SELECT COUNT(*) FROM processed_features").fetchone()[0]
+
+    conn.close()
+
+    if raw_count == 0:
         for split in ("train", "test"):
-            txt = _ROOT / "data" / "raw" / f"{split}_{fd_id}.txt"
-            if txt.exists():
-                migrate_raw_to_db(fd_id, split)
+            migrate_raw_to_db("FD004", split)
+
+    if feat_count == 0:
+        for split in ("train", "test"):
+            migrate_processed_to_db("FD004", split)
+
+    if rul_count == 0:
+        migrate_rul_labels_to_db("FD004")
+
+    if runs_count == 0:
+        migrate_agent_runs_jsonl()
 
 
 # ---------------------------------------------------------------------------
-# Write helpers
+# Migration functions
+# ---------------------------------------------------------------------------
+
+def migrate_raw_to_db(fd_id: str, split: str) -> int:
+    """Import a raw CMAPSS txt file into raw_sensor_data. Returns rows inserted."""
+    import pandas as pd
+
+    cols = ["unit", "cycle", "op1", "op2", "op3"] + [f"s{i}" for i in range(1, 22)]
+    txt = _ROOT / "data" / "raw" / f"{split}_{fd_id}.txt"
+    if not txt.exists():
+        return 0
+
+    df = pd.read_csv(txt, sep=r"\s+", header=None, names=cols)
+    df.insert(0, "split", split)
+    df.insert(0, "dataset", fd_id)
+
+    conn = get_db()
+    df.to_sql("raw_sensor_data", conn, if_exists="append", index=False)
+    conn.commit()
+    n = len(df)
+    conn.close()
+    return n
+
+
+def migrate_processed_to_db(fd_id: str, split: str) -> int:
+    """Import a processed parquet file into processed_features. Returns rows inserted.
+
+    The table schema is created dynamically from the parquet columns on first call.
+    """
+    import pandas as pd
+
+    path = _ROOT / "data" / "processed" / f"{fd_id}_{split}.parquet"
+    if not path.exists():
+        return 0
+
+    df = pd.read_parquet(path)
+    # Ensure string/categorical columns are plain str for SQLite compatibility
+    for col in df.select_dtypes(include=["category", "object"]).columns:
+        df[col] = df[col].astype(str)
+    # Parquet may already contain dataset/split; set/overwrite to ensure correctness
+    df["dataset"] = fd_id
+    df["split"] = split
+
+    conn = get_db()
+    df.to_sql(
+        "processed_features", conn,
+        if_exists="append", index=False,
+        method="multi", chunksize=5000,
+    )
+    # Add index on first write (IF NOT EXISTS is safe on repeated calls)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feat_unit "
+        "ON processed_features(dataset, split, unit)"
+    )
+    conn.commit()
+    n = len(df)
+    conn.close()
+    return n
+
+
+def migrate_rul_labels_to_db(fd_id: str) -> int:
+    """Import ground-truth RUL labels from RUL_{fd_id}.txt into rul_labels.
+
+    Engine IDs are 1-indexed to match the convention used throughout the codebase.
+    Returns number of rows inserted.
+    """
+    import pandas as pd
+
+    path = _ROOT / "data" / "raw" / f"RUL_{fd_id}.txt"
+    if not path.exists():
+        return 0
+
+    series = pd.read_csv(path, header=None, names=["rul_true"])["rul_true"]
+    conn = get_db()
+    for i, rul in enumerate(series, start=1):
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO rul_labels (dataset, engine_id, rul_true) VALUES (?,?,?)",
+                (fd_id, i, int(rul)),
+            )
+        except sqlite3.IntegrityError:
+            pass
+    conn.commit()
+    n = len(series)
+    conn.close()
+    return n
+
+
+def migrate_agent_runs_jsonl() -> int:
+    """Import historical agent_runs.jsonl records into agent_runs table.
+
+    Runs only if the table is empty and the jsonl file exists.
+    Returns number of rows inserted.
+    """
+    jsonl_path = _ROOT / "outputs" / "agent_runs.jsonl"
+    if not jsonl_path.exists():
+        return 0
+
+    records = []
+    with open(jsonl_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    if not records:
+        return 0
+
+    conn = get_db()
+    for r in records:
+        try:
+            conn.execute(
+                """INSERT INTO agent_runs
+                   (timestamp, engine_id, query, recommendation, tool_calls,
+                    turns, latency_ms, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    r.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                    r.get("engine_id"),
+                    r.get("query"),
+                    r.get("recommendation"),
+                    json.dumps(r.get("tool_calls", [])),
+                    r.get("turns"),
+                    r.get("latency_ms"),
+                    r.get("error"),
+                ),
+            )
+        except Exception:
+            continue
+    conn.commit()
+    conn.close()
+    return len(records)
+
+
+# ---------------------------------------------------------------------------
+# Write helpers (inference path — never raise)
 # ---------------------------------------------------------------------------
 
 def log_prediction(engine_id: int, pred: Dict[str, Any]) -> None:
@@ -147,7 +320,7 @@ def log_prediction(engine_id: int, pred: Dict[str, Any]) -> None:
             )
         conn.close()
     except Exception:
-        pass  # never crash the main inference path
+        pass
 
 
 def log_agent_run(run: Dict[str, Any]) -> None:
@@ -207,27 +380,6 @@ def log_drift_metrics(metrics: List[Dict[str, Any]]) -> None:
     conn.close()
 
 
-def migrate_raw_to_db(fd_id: str, split: str) -> int:
-    """Import a raw CMAPSS txt file into raw_sensor_data. Returns rows inserted."""
-    import pandas as pd
-
-    cols = ["unit", "cycle", "op1", "op2", "op3"] + [f"s{i}" for i in range(1, 22)]
-    txt = _ROOT / "data" / "raw" / f"{split}_{fd_id}.txt"
-    if not txt.exists():
-        return 0
-
-    df = pd.read_csv(txt, sep=r"\s+", header=None, names=cols)
-    df.insert(0, "split", split)
-    df.insert(0, "dataset", fd_id)
-
-    conn = get_db()
-    df.to_sql("raw_sensor_data", conn, if_exists="append", index=False)
-    conn.commit()
-    n = len(df)
-    conn.close()
-    return n
-
-
 # ---------------------------------------------------------------------------
 # Read helpers
 # ---------------------------------------------------------------------------
@@ -264,6 +416,17 @@ def get_latest_drift() -> List[Dict]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_rul_labels(fd_id: str = "FD004") -> Dict[int, int]:
+    """Return {engine_id: rul_true} mapping from rul_labels table."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT engine_id, rul_true FROM rul_labels WHERE dataset=? ORDER BY engine_id",
+        (fd_id,),
+    ).fetchall()
+    conn.close()
+    return {r["engine_id"]: r["rul_true"] for r in rows}
 
 
 # Initialise on import
