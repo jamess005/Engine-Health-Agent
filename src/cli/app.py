@@ -409,7 +409,7 @@ def display_drift_report(data: dict) -> None:
     if sig > 0:
         flagged = ", ".join(data.get("flagged", [])[:5])
         print(f"\n  {RED}ACTION: Significant drift in {flagged}.")
-        print(f"  Investigate whether operating conditions or sensor calibration")
+        print("  Investigate whether operating conditions or sensor calibration")
         print(f"  have changed. Model predictions may be less reliable.{RESET}")
     elif mod > 0:
         print(f"\n  {YELLOW}MONITOR: Moderate drift detected. Continue monitoring.{RESET}")
