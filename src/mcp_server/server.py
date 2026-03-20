@@ -147,6 +147,12 @@ def estimate_rul(engine_id: int) -> Dict:
     last_rul = eng[eng["rul"].notna()]["rul"]
     rul_true_val: Optional[float] = float(last_rul.iloc[0]) if len(last_rul) > 0 else None
     result["rul_true"] = rul_true_val
+    # Log to DB (non-blocking — never raises)
+    try:
+        from src.db.database import log_prediction
+        log_prediction(engine_id, result)
+    except Exception:
+        pass
     return result
 
 
@@ -692,6 +698,32 @@ def forecast_journey(engine_id: int, legs: str) -> Dict:
 
     return project_journey(eng, parsed_legs, regressor=reg,
                            rate_multiplier=rate)
+
+
+@mcp.tool()
+def get_drift_report() -> Dict:
+    """Return the latest sensor drift report.
+
+    Retrieves the most recent PSI drift check from the database.
+    Run `python -m src.cli.app --drift` to compute a fresh report.
+
+    Returns:
+        timestamp: When the last drift check was run.
+        features_checked: Number of sensor features evaluated.
+        no_drift: Features with PSI < 0.10 (stable).
+        moderate_drift: Features with PSI 0.10–0.25 (monitor).
+        significant_drift: Features with PSI > 0.25 (investigate).
+        flagged: List of feature names with any drift.
+        details: Per-feature PSI scores and statistics.
+    """
+    from src.drift.drift_monitor import get_drift_summary
+    summary = get_drift_summary()
+    if summary is None:
+        return {
+            "error": "No drift check has been run yet. "
+                     "Run: python -m src.cli.app --drift"
+        }
+    return summary
 
 
 def fleet_health_summary(flag_degradation: bool = False) -> dict:

@@ -12,3 +12,6 @@ outputs/
 models/
 models/llama-3.1-8b-instruct/
 *.pdf
+*.db
+*.db-shm
+*.db-wal

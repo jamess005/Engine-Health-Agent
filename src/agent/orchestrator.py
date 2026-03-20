@@ -1,7 +1,7 @@
-"""Engine Health Agent — LangChain ReAct agent with local Llama 3.1 8B.
+"""Engine Health Agent — deterministic protocol orchestrator.
 
-Uses a text-based ReAct loop (Thought/Action/Observation) for reliable
-tool calling with the local model.  No Ollama dependency.
+Runs a fixed analytical protocol (no LLM) for reliable, consistent engine
+health assessment on NASA CMAPSS FD004 turbofan data.
 
 Usage::
 
@@ -15,7 +15,6 @@ Usage::
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 import time
@@ -27,88 +26,11 @@ from typing import Any, Callable, Dict, List, Optional
 from langchain_core.tools import tool as langchain_tool
 
 os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+warnings.filterwarnings("ignore")
 
 _ROOT = Path(__file__).resolve().parents[2]
-_MODEL_DIR = _ROOT / "models" / "llama-3.1-8b-instruct"
-_RUNS_FP = _ROOT / "outputs" / "agent_runs.jsonl"
-_RUNS_FP.parent.mkdir(parents=True, exist_ok=True)
 
 MAX_STEPS = 8
-
-# ---------------------------------------------------------------------------
-# Model loading  (singleton)
-# ---------------------------------------------------------------------------
-
-_chat_singleton = None
-
-
-def _resolve_model_path(base: Path) -> Path:
-    refs = base / "refs" / "main"
-    if refs.exists():
-        rev = refs.read_text().strip()
-        snap = base / "snapshots" / rev
-        if snap.exists():
-            return snap
-    return base
-
-
-def load_llm(print_fn: Callable[..., None] = print):
-    """Load Llama 3.1 8B Instruct in 4-bit, return ChatHuggingFace (cached)."""
-    global _chat_singleton
-    if _chat_singleton is not None:
-        return _chat_singleton
-
-    import torch
-    from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from transformers import pipeline as hf_pipeline
-
-    model_path = str(_resolve_model_path(_MODEL_DIR))
-    print_fn("  Loading Llama 3.1 8B Instruct (4-bit) ...")
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    quant_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        quantization_config=quant_config,
-        device_map="cuda:0",
-        max_memory={0: "14GiB"},
-        low_cpu_mem_usage=True,
-    )
-    torch.cuda.empty_cache()
-
-    # Configure generation — set on model config to avoid deprecation warnings
-    model.generation_config.max_length = None
-    model.generation_config.max_new_tokens = 1024
-
-    # Suppress noisy transformers generation warnings
-    warnings.filterwarnings("ignore", message=".*max_new_tokens.*max_length.*")
-    warnings.filterwarnings("ignore", message=".*generation_config.*deprecated.*")
-    logging.getLogger("transformers.generation.utils").setLevel(logging.ERROR)
-
-    pipe = hf_pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        return_full_text=False,
-    )
-
-    llm = HuggingFacePipeline(
-        pipeline=pipe,
-        pipeline_kwargs={"max_new_tokens": 1024},
-    )
-    _chat_singleton = ChatHuggingFace(llm=llm)
-    print_fn("  Model loaded (4-bit, ~5 GB VRAM).")
-    return _chat_singleton
 
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +964,14 @@ class AgentOrchestrator:
 
     def _persist(self, result: Dict) -> None:
         try:
-            with open(_RUNS_FP, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(result, default=str) + "\n")
-        except OSError:
-            pass
+            from src.db.database import log_agent_run
+            log_agent_run(result)
+        except Exception:
+            # Fallback: write to jsonl if DB unavailable
+            try:
+                runs_fp = _ROOT / "outputs" / "agent_runs.jsonl"
+                runs_fp.parent.mkdir(parents=True, exist_ok=True)
+                with open(runs_fp, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(result, default=str) + "\n")
+            except OSError:
+                pass

@@ -369,6 +369,58 @@ def _display_journeys(journeys: list, mae: float) -> None:
             print(f"        Final RUL: ≈{final_rul:.0f}")
 
 
+def display_drift_report(data: dict) -> None:
+    """Print PSI drift report."""
+    from src.models.what_if import prettify_sensors
+
+    if data.get("error"):
+        err(data["error"])
+        return
+
+    banner("Sensor Drift Report — NASA CMAPSS FD004")
+    ts = data.get("timestamp", "")[:19].replace("T", " ")
+    total = data.get("features_checked", 0)
+    sig = data.get("significant_drift", 0)
+    mod = data.get("moderate_drift", 0)
+    ok_n = data.get("no_drift", 0)
+
+    print(f"\n  {DIM}Computed: {ts} | {total} features checked{RESET}")
+    print(f"\n  {GREEN}✓ No drift{RESET}       : {ok_n} features  (PSI < 0.10)")
+    print(f"  {YELLOW}⚠ Moderate drift{RESET} : {mod} features  (PSI 0.10–0.25)")
+    print(f"  {RED}✗ Significant{RESET}    : {sig} features  (PSI > 0.25)")
+
+    details = data.get("details", [])
+    if details:
+        print(f"\n  {'Feature':<14} {'PSI':>7}  {'Status'}")
+        print(f"  {'-'*40}")
+        for row in details:
+            feat = row.get("feature", "")
+            psi = row.get("psi_score", 0.0)
+            level = row.get("drift_level", "none")
+            label = prettify_sensors(feat) if feat.startswith("n_s") else feat
+            if level == "significant":
+                colour, symbol = RED, "✗"
+            elif level == "moderate":
+                colour, symbol = YELLOW, "⚠"
+            else:
+                colour, symbol = GREEN, "✓"
+            print(f"  {label:<14} {psi:>7.4f}  {colour}{symbol} {level}{RESET}")
+
+    if sig > 0:
+        flagged = ", ".join(data.get("flagged", [])[:5])
+        print(f"\n  {RED}ACTION: Significant drift in {flagged}.")
+        print(f"  Investigate whether operating conditions or sensor calibration")
+        print(f"  have changed. Model predictions may be less reliable.{RESET}")
+    elif mod > 0:
+        print(f"\n  {YELLOW}MONITOR: Moderate drift detected. Continue monitoring.{RESET}")
+    else:
+        print(f"\n  {GREEN}All features within normal distribution range.{RESET}")
+
+    print(f"\n  {DIM}PSI algorithm: Population Stability Index")
+    print(f"  Baseline: FD004 training set | Current: FD004 test set{RESET}")
+    print(f"{'=' * W}\n")
+
+
 def display_fleet_health(data: dict) -> None:
     """Print fleet health overview bucketed by RUL tier."""
     counts = data["counts"]
@@ -554,6 +606,7 @@ def interactive_mode() -> None:
   {BOLD}Commands:{RESET}
     <number>     Analyse engine 1-248
     fleet        Fleet health overview (all 248 engines)
+    drift        Sensor drift report (PSI vs training baseline)
     demo         Show demo scenarios
     q            Quit
 """
@@ -585,6 +638,12 @@ def interactive_mode() -> None:
         if low == "fleet":
             from src.mcp_server.server import fleet_health_summary
             display_fleet_health(fleet_health_summary())
+            continue
+
+        if low == "drift":
+            from src.drift.drift_monitor import run_drift_check
+            print(f"  {DIM}Computing PSI drift check ...{RESET}")
+            display_drift_report(run_drift_check())
             continue
 
         if low == "demo":
@@ -647,8 +706,17 @@ def main() -> None:
     parser.add_argument(
         "--fleet", action="store_true", help="Print fleet health overview (all 248 engines)"
     )
+    parser.add_argument(
+        "--drift", action="store_true", help="Run sensor drift report (PSI vs training baseline)"
+    )
 
     args = parser.parse_args()
+
+    if args.drift:
+        from src.drift.drift_monitor import run_drift_check
+        print(f"  {DIM}Computing PSI drift check ...{RESET}")
+        display_drift_report(run_drift_check())
+        return
 
     if args.fleet:
         from src.mcp_server.server import fleet_health_summary
