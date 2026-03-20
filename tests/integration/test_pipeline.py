@@ -1,6 +1,5 @@
 """Integration tests — end-to-end pipeline from DB through feature builder."""
 
-import pytest
 
 
 def test_load_and_feature_pipeline():
