@@ -14,8 +14,10 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 import warnings
+from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -28,26 +30,43 @@ load_dotenv()
 configure_logging()
 warnings.filterwarnings("ignore")
 
-app = FastAPI(
-    title="Engine Health API",
-    description="Predictive maintenance agent for NASA CMAPSS FD004 turbofan engines.",
-    version="1.0.0",
-)
-
 
 # ---------------------------------------------------------------------------
-# Lazy model singletons
+# Lazy model singletons (thread-safe double-checked locking)
 # ---------------------------------------------------------------------------
 
 _reg = None
+_reg_lock = threading.Lock()
 
 
 def _get_reg():
     global _reg
     if _reg is None:
-        from src.models.rul_regressor import RULRegressor
-        _reg = RULRegressor.load()
+        with _reg_lock:
+            if _reg is None:
+                from src.models.rul_regressor import RULRegressor
+                _reg = RULRegressor.load()
     return _reg
+
+
+# ---------------------------------------------------------------------------
+# Application lifespan — preload model and prune stale jobs on startup
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _get_reg()
+    from src.db.database import prune_old_jobs
+    prune_old_jobs()
+    yield
+
+
+app = FastAPI(
+    title="Engine Health API",
+    description="Predictive maintenance agent for NASA CMAPSS FD004 turbofan engines.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +74,8 @@ def _get_reg():
 # ---------------------------------------------------------------------------
 
 class AgentQueryRequest(BaseModel):
-    engine_id: int = Field(..., description="Engine unit number (1–248 test, 1–249 train).")
-    query_text: str = Field(..., description="Natural language question about the engine.")
+    engine_id: int = Field(..., ge=1, le=248, description="Engine unit number (1–248 test set).")
+    query_text: str = Field(..., min_length=1, max_length=2000, description="Natural language question about the engine.")
 
 
 class AgentQueryResponse(BaseModel):
@@ -77,7 +96,7 @@ class AgentResultResponse(BaseModel):
 
 
 class RULRequest(BaseModel):
-    engine_id: int = Field(..., description="Engine unit number.")
+    engine_id: int = Field(..., ge=1, le=248, description="Engine unit number (1–248).")
 
 
 class RULResponse(BaseModel):

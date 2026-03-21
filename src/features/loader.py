@@ -4,9 +4,12 @@ All functions try the SQLite database first and fall back to the original
 flat files (parquet / txt) if the database is unavailable or empty.
 """
 
+import logging
 from pathlib import Path
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _RAW = _ROOT / "data" / "raw"
@@ -41,15 +44,17 @@ def load_raw(fd_id: str, split: str = "train") -> pd.DataFrame:
                 conn, params=(fd_id, split),
             ).drop(columns=["id", "split"], errors="ignore")
             conn.close()
+            logger.debug("load_raw: loaded %s/%s from SQLite (%d rows)", fd_id, split, len(df))
             return df
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("load_raw: DB query failed for %s/%s, falling back to txt: %s", fd_id, split, exc)
 
     # Fallback: read from txt file
     path = _RAW / f"{split}_{fd_id}.txt"
     df = pd.read_csv(path, sep=r"\s+", header=None, names=COLS)
     df["dataset"] = fd_id
+    logger.info("load_raw: loaded %s/%s from txt file (DB unavailable or empty)", fd_id, split)
     return df
 
 
@@ -87,6 +92,7 @@ def load_processed(fd_id: str, split: str = "train", add_op_settings: bool = Tru
                 conn, params=(fd_id, split),
             ).drop(columns=["id", "dataset", "split"], errors="ignore")
             conn.close()
+            logger.debug("load_processed: loaded %s/%s from SQLite (%d rows)", fd_id, split, len(df))
 
             # If op1/op2/op3 not present but os1/os2/os3 are, alias them back
             # (os1 = op1, os2 = op2, os3 = op3 — same values, builder needs op* name)
@@ -106,14 +112,15 @@ def load_processed(fd_id: str, split: str = "train", add_op_settings: bool = Tru
                         )
                         raw_conn.close()
                         df = df.merge(op_df, on=["unit", "cycle"], how="left")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("load_processed: could not fetch op settings from raw_sensor_data: %s", exc)
             return df
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("load_processed: DB query failed for %s/%s, falling back to parquet: %s", fd_id, split, exc)
 
     # Fallback: read from parquet
+    logger.info("load_processed: loading %s/%s from parquet (DB unavailable or empty)", fd_id, split)
     path = _PROCESSED / f"{fd_id}_{split}.parquet"
     df = pd.read_parquet(path)
     if add_op_settings and "op1" not in df.columns:
@@ -147,10 +154,13 @@ def load_rul_labels(fd_id: str) -> pd.Series:
         ).fetchall()
         conn.close()
         if rows:
+            logger.debug("load_rul_labels: loaded %s from SQLite (%d engines)", fd_id, len(rows))
             return pd.Series([r[0] for r in rows], name="rul_true")
-    except Exception:
-        pass
+        conn.close()
+    except Exception as exc:
+        logger.warning("load_rul_labels: DB query failed for %s, falling back to txt: %s", fd_id, exc)
 
     # Fallback: read from txt file
+    logger.info("load_rul_labels: loading %s from txt file (DB unavailable or empty)", fd_id)
     path = _RAW / f"RUL_{fd_id}.txt"
     return pd.read_csv(path, header=None, names=["rul_true"])["rul_true"]

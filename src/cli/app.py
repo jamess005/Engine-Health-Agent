@@ -92,10 +92,166 @@ def _extract_tool_data(result: dict) -> dict:
     return data
 
 
-def _display_structured(result: dict) -> None:
-    """Build structured display from real tool data + LLM recommendation."""
-    from src.models.what_if import prettify_sensors
+def _display_rul(rul_data: dict, engine_id) -> None:
+    """Print engine ID, RUL, accuracy tier, and bias note if applicable."""
+    rul = float(rul_data.get("rul", 0))
+    acc = rul_data.get("accuracy", {})
+    label = f"ENGINE {engine_id}" if engine_id else "ENGINE"
+    mae_str = f"(±{acc['mae']:.0f} RUL)" if acc else ""
+    print(f"  {BOLD}{label}: RUL {rul:.1f} {mae_str}{RESET}")
+    if acc and abs(acc.get("bias", 0)) > 3:
+        direction = "over" if acc["bias"] > 0 else "under"
+        bc_rul = rul - acc["bias"]
+        print(f"  {DIM}Model tends to {direction}-predict by "
+              f"~{abs(acc['bias']):.0f} RUL here. "
+              f"Bias-corrected: ~{bc_rul:.0f}{RESET}")
 
+
+def _display_degradation(deg_data: dict, diag_data: dict) -> None:
+    """Print degradation rate and sensor-level detail."""
+    from src.models.what_if import prettify_sensors, SENSOR_LABELS
+    rate = deg_data.get("rate_multiplier", 1.0)
+    if rate < 0.7:
+        s_slopes = deg_data.get("sensor_slopes", {})
+        f_slopes = deg_data.get("fleet_slopes", {})
+        below = [
+            prettify_sensors(s)
+            for s, v in s_slopes.items()
+            if abs(v) < abs(f_slopes.get(s, v or 1)) * 0.6
+            and abs(f_slopes.get(s, 1)) > 1e-6
+        ]
+        sensor_note = (
+            f" — {', '.join(below[:2])} reading below fleet norm; "
+            f"possible sensor calibration drift"
+            if below else ""
+        )
+        print(f"  Degradation: {rate:.2f}x fleet average — "
+              f"{GREEN}below normal{RESET}{sensor_note}")
+    elif rate > 1.3:
+        pct = (rate - 1) * 100
+        print(f"  Degradation: {rate:.2f}x fleet average — "
+              f"{RED}abnormal{RESET}")
+        print(f"    Degrading {pct:.0f}% faster than fleet average.")
+        if diag_data:
+            findings = diag_data.get("sensor_findings", [])
+            shown = 0
+            for finding in findings:
+                if finding.get("category") in (
+                    "accelerated_wear", "malfunction", "anomalous"
+                ) and shown < 3:
+                    sensor_name = prettify_sensors(finding["sensor"])
+                    ratio = finding.get("slope_ratio", 0)
+                    cat = finding["category"].replace("_", " ")
+                    print(f"    • {sensor_name}: "
+                          f"{ratio:.1f}× fleet rate — {cat}")
+                    shown += 1
+        else:
+            s_slopes = deg_data.get("sensor_slopes", {})
+            f_slopes = deg_data.get("fleet_slopes", {})
+            for s, v in s_slopes.items():
+                fleet_v = f_slopes.get(s, 0)
+                if abs(fleet_v) > 1e-6:
+                    ratio = abs(v) / abs(fleet_v)
+                    if ratio > 1.3:
+                        sensor_name = SENSOR_LABELS.get(s, s)
+                        print(f"    • {sensor_name}: "
+                              f"{ratio:.1f}× fleet rate")
+    else:
+        print(f"  Degradation: {rate:.2f}x fleet average — "
+              f"{GREEN}normal{RESET}")
+
+
+def _display_diagnosis(diag_data: dict, deg_data: dict) -> None:
+    """Print root cause and risk level."""
+    from src.models.what_if import prettify_sensors
+    cause = prettify_sensors(
+        diag_data.get("primary_cause", "standard operational wear")
+    )
+    risk = diag_data.get("risk_level", "")
+    colour = RED if risk == "CRITICAL" else (YELLOW if risk == "HIGH" else GREEN)
+    if deg_data and deg_data.get("rate_multiplier", 1.0) > 1.3:
+        print(f"  {colour}Risk: {risk}{RESET} — {cause}")
+    else:
+        print(f"  Diagnosis: {cause} ({colour}risk: {risk}{RESET})")
+
+
+def _display_flight_status(rul_data: dict, journeys: list) -> None:
+    """Print GROUNDED / NOT ADVISED / FLIGHT ASSESSMENT / CLEARED block."""
+    rul = float(rul_data.get("rul", 0)) if rul_data else 999
+    acc = rul_data.get("accuracy", {}) if rul_data else {}
+    mae = acc.get("mae", 4) if acc else 4
+
+    if rul <= 6:
+        print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
+        print(f"    {RED}✗ GROUNDED{RESET} — RUL {rul:.1f}. "
+              f"High risk of engine failure.")
+        print("    No flights permitted. Remove from service "
+              "for immediate maintenance.")
+    elif rul <= 10:
+        print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
+        print(f"    {YELLOW}⚠ NOT ADVISED{RESET} — RUL {rul:.1f}. "
+              f"Approaching end of serviceable life.")
+        print("    Flights not recommended without "
+              "operational necessity. Schedule maintenance now.")
+        if journeys:
+            _display_journeys(journeys, mae)
+    elif rul <= 50:
+        print(f"\n  {BOLD}FLIGHT ASSESSMENT{RESET} "
+              f"(model accuracy: ±{mae:.0f} RUL at this range)")
+        if journeys:
+            _display_journeys(journeys, mae)
+    else:
+        mae = acc.get("mae", 15)
+        print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
+        print(f"    {GREEN}✓ CLEARED{RESET} — All operating conditions "
+              f"permitted.")
+        print(f"    Model accuracy at this lifecycle stage: "
+              f"±{mae:.0f} RUL (MAE).")
+        print(f"    {DIM}Detailed journey assessment available when "
+              f"RUL approaches 50.{RESET}")
+
+
+def _display_maintenance(maint_data: dict) -> None:
+    """Print maintenance urgency and action window."""
+    urgency = maint_data.get("urgency", "?")
+    colour = RED if urgency == "IMMEDIATE" else (YELLOW if urgency == "HIGH" else GREEN)
+    print(f"\n  {BOLD}MAINTENANCE{RESET}: {colour}{urgency}{RESET}")
+    rul_now = maint_data.get("rul", "?")
+    urgency = maint_data.get("urgency", "")
+    if urgency == "IMMEDIATE":
+        print(f"    RUL {rul_now} — ground immediately due to high "
+              f"risk of engine failure.")
+        print(f"    {DIM}Safety threshold: 6 RUL. Full inspection "
+              f"and service required before any further "
+              f"operation.{RESET}")
+    elif urgency == "HIGH":
+        print(f"    RUL {rul_now} — schedule service now to remain "
+              f"above the recommended threshold (RUL 10).")
+    else:
+        print(f"    RUL {rul_now} — routine service recommended "
+              f"to maintain operational readiness.")
+
+
+def _display_replacement(replacement_data: dict) -> None:
+    """Print replacement engine candidates."""
+    cands = replacement_data["candidates"]
+    print(f"\n  {BOLD}REPLACEMENT CANDIDATES{RESET}")
+    for c in cands:
+        cond_info = ""
+        if c.get("dominant_condition_label"):
+            match_tag = ""
+            if c.get("condition_match"):
+                match_tag = f" {GREEN}✓ compatible{RESET}"
+            elif c.get("condition_match") is False:
+                match_tag = f" {YELLOW}~ different profile{RESET}"
+            cond_info = (f" | Primary: {c['dominant_condition_label']}"
+                        f"{match_tag}")
+        print(f"    Engine {c['engine_id']}: "
+              f"RUL {c['predicted_rul']:.0f}{cond_info}")
+
+
+def _display_structured(result: dict) -> None:
+    """Build structured display from real tool data + agent recommendation."""
     engine_id = result.get("engine_id")
     tools = _extract_tool_data(result)
 
@@ -106,163 +262,17 @@ def _display_structured(result: dict) -> None:
     journeys = tools.get("forecast_journeys", [])
     replacement_data = tools.get("find_replacement_engine", {})
 
-    # -- Engine status with model accuracy (not ensemble CI)
     if rul_data:
-        rul = float(rul_data.get("rul", 0))
-        acc = rul_data.get("accuracy", {})
-        label = f"ENGINE {engine_id}" if engine_id else "ENGINE"
-        mae_str = f"(±{acc['mae']:.0f} RUL)" if acc else ""
-        print(f"  {BOLD}{label}: RUL {rul:.1f} {mae_str}{RESET}")
-
-        # Bias note when model has significant bias in this range
-        if acc and abs(acc.get("bias", 0)) > 3:
-            direction = "over" if acc["bias"] > 0 else "under"
-            bc_rul = rul - acc["bias"]
-            print(f"  {DIM}Model tends to {direction}-predict by "
-                  f"~{abs(acc['bias']):.0f} RUL here. "
-                  f"Bias-corrected: ~{bc_rul:.0f}{RESET}")
-
-    # -- Degradation with sensor-level detail
+        _display_rul(rul_data, engine_id)
     if deg_data:
-        from src.models.what_if import SENSOR_LABELS
-        rate = deg_data.get("rate_multiplier", 1.0)
-        if rate < 0.7:
-            s_slopes = deg_data.get("sensor_slopes", {})
-            f_slopes = deg_data.get("fleet_slopes", {})
-            below = [
-                prettify_sensors(s)
-                for s, v in s_slopes.items()
-                if abs(v) < abs(f_slopes.get(s, v or 1)) * 0.6
-                and abs(f_slopes.get(s, 1)) > 1e-6
-            ]
-            sensor_note = (
-                f" — {', '.join(below[:2])} reading below fleet norm; "
-                f"possible sensor calibration drift"
-                if below else ""
-            )
-            print(f"  Degradation: {rate:.2f}x fleet average — "
-                  f"{GREEN}below normal{RESET}{sensor_note}")
-        elif rate > 1.3:
-            pct = (rate - 1) * 100
-            print(f"  Degradation: {rate:.2f}x fleet average — "
-                  f"{RED}abnormal{RESET}")
-            print(f"    Degrading {pct:.0f}% faster than fleet average.")
-            if diag_data:
-                findings = diag_data.get("sensor_findings", [])
-                shown = 0
-                for finding in findings:
-                    if finding.get("category") in (
-                        "accelerated_wear", "malfunction", "anomalous"
-                    ) and shown < 3:
-                        sensor_name = prettify_sensors(finding["sensor"])
-                        ratio = finding.get("slope_ratio", 0)
-                        cat = finding["category"].replace("_", " ")
-                        print(f"    • {sensor_name}: "
-                              f"{ratio:.1f}× fleet rate — {cat}")
-                        shown += 1
-            else:
-                s_slopes = deg_data.get("sensor_slopes", {})
-                f_slopes = deg_data.get("fleet_slopes", {})
-                for s, v in s_slopes.items():
-                    fleet_v = f_slopes.get(s, 0)
-                    if abs(fleet_v) > 1e-6:
-                        ratio = abs(v) / abs(fleet_v)
-                        if ratio > 1.3:
-                            sensor_name = SENSOR_LABELS.get(s, s)
-                            print(f"    • {sensor_name}: "
-                                  f"{ratio:.1f}× fleet rate")
-        else:
-            print(f"  Degradation: {rate:.2f}x fleet average — "
-                  f"{GREEN}normal{RESET}")
-
-    # -- Diagnosis
+        _display_degradation(deg_data, diag_data)
     if diag_data:
-        cause = prettify_sensors(
-            diag_data.get("primary_cause", "standard operational wear")
-        )
-        risk = diag_data.get("risk_level", "")
-        colour = RED if risk == "CRITICAL" else (
-            YELLOW if risk == "HIGH" else GREEN)
-        if deg_data and deg_data.get("rate_multiplier", 1.0) > 1.3:
-            print(f"  {colour}Risk: {risk}{RESET} — {cause}")
-        else:
-            print(f"  Diagnosis: {cause} ({colour}risk: {risk}{RESET})")
-
-    # -- Flight assessment
-    rul = float(rul_data.get("rul", 0)) if rul_data else 999
-    acc = rul_data.get("accuracy", {}) if rul_data else {}
-    mae = acc.get("mae", 4) if acc else 4
-
-    if rul <= 6:
-        # GROUNDED — at or below safety limit
-        print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
-        print(f"    {RED}✗ GROUNDED{RESET} — RUL {rul:.1f}. "
-              f"High risk of engine failure.")
-        print("    No flights permitted. Remove from service "
-              "for immediate maintenance.")
-    elif rul <= 10:
-        # NOT ADVISED — within advisory limit
-        print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
-        print(f"    {YELLOW}⚠ NOT ADVISED{RESET} — RUL {rul:.1f}. "
-              f"Approaching end of serviceable life.")
-        print("    Flights not recommended without "
-              "operational necessity. Schedule maintenance now.")
-        if journeys:
-            _display_journeys(journeys, mae)
-    elif rul <= 50:
-        # PLANNABLE RANGE — show flight assessment
-        print(f"\n  {BOLD}FLIGHT ASSESSMENT{RESET} "
-              f"(model accuracy: ±{mae:.0f} RUL at this range)")
-        if journeys:
-            _display_journeys(journeys, mae)
-    else:
-        # HEALTHY — model uncertainty too high for detailed planning
-        mae = acc.get("mae", 15)
-        print(f"\n  {BOLD}FLIGHT STATUS{RESET}")
-        print(f"    {GREEN}✓ CLEARED{RESET} — All operating conditions "
-              f"permitted.")
-        print(f"    Model accuracy at this lifecycle stage: "
-              f"±{mae:.0f} RUL (MAE).")
-        print(f"    {DIM}Detailed journey assessment available when "
-              f"RUL approaches 50.{RESET}")
-
-    # -- Maintenance
+        _display_diagnosis(diag_data, deg_data)
+    _display_flight_status(rul_data, journeys)
     if maint_data:
-        urgency = maint_data.get("urgency", "?")
-        colour = RED if urgency == "IMMEDIATE" else (
-            YELLOW if urgency == "HIGH" else GREEN)
-        print(f"\n  {BOLD}MAINTENANCE{RESET}: {colour}{urgency}{RESET}")
-        rul_now = maint_data.get("rul", "?")
-        urgency = maint_data.get("urgency", "")
-        if urgency == "IMMEDIATE":
-            print(f"    RUL {rul_now} — ground immediately due to high "
-                  f"risk of engine failure.")
-            print(f"    {DIM}Safety threshold: 6 RUL. Full inspection "
-                  f"and service required before any further "
-                  f"operation.{RESET}")
-        elif urgency == "HIGH":
-            print(f"    RUL {rul_now} — schedule service now to remain "
-                  f"above the recommended threshold (RUL 10).")
-        else:
-            print(f"    RUL {rul_now} — routine service recommended "
-                  f"to maintain operational readiness.")
-
-    # -- Replacement engines
+        _display_maintenance(maint_data)
     if replacement_data and replacement_data.get("candidates"):
-        cands = replacement_data["candidates"]
-        print(f"\n  {BOLD}REPLACEMENT CANDIDATES{RESET}")
-        for c in cands:
-            cond_info = ""
-            if c.get("dominant_condition_label"):
-                match_tag = ""
-                if c.get("condition_match"):
-                    match_tag = f" {GREEN}✓ compatible{RESET}"
-                elif c.get("condition_match") is False:
-                    match_tag = f" {YELLOW}~ different profile{RESET}"
-                cond_info = (f" | Primary: {c['dominant_condition_label']}"
-                            f"{match_tag}")
-            print(f"    Engine {c['engine_id']}: "
-                  f"RUL {c['predicted_rul']:.0f}{cond_info}")
+        _display_replacement(replacement_data)
 
 
 def _rul_tag(rul_val: float, mae: float) -> tuple:

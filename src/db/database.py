@@ -16,6 +16,7 @@ Tables:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load .env before any os.getenv calls — safe no-op if file absent
 load_dotenv()
@@ -303,7 +306,8 @@ def migrate_agent_runs_jsonl() -> int:
                     r.get("error"),
                 ),
             )
-        except Exception:
+        except Exception as exc:
+            logger.debug("Skipped bad JSONL record: %s", exc)
             continue
     conn.commit()
     conn.close()
@@ -334,8 +338,8 @@ def log_prediction(engine_id: int, pred: Dict[str, Any]) -> None:
                 ),
             )
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("log_prediction failed for engine %d: %s", engine_id, exc)
 
 
 def log_agent_run(run: Dict[str, Any]) -> None:
@@ -360,8 +364,8 @@ def log_agent_run(run: Dict[str, Any]) -> None:
                 ),
             )
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("log_agent_run failed: %s", exc)
 
 
 def log_drift_metrics(metrics: List[Dict[str, Any]]) -> None:
@@ -460,8 +464,8 @@ def create_job(job_id: str, engine_id: Optional[int]) -> None:
                 (job_id, engine_id, ts, ts),
             )
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("create_job failed for %s: %s", job_id, exc)
 
 
 def update_job(job_id: str, status: str, result: Optional[Dict[str, Any]] = None) -> None:
@@ -475,8 +479,8 @@ def update_job(job_id: str, status: str, result: Optional[Dict[str, Any]] = None
                 (status, json.dumps(result) if result is not None else None, ts, job_id),
             )
         conn.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("update_job failed for %s: %s", job_id, exc)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -496,8 +500,37 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
             except (json.JSONDecodeError, ValueError):
                 pass
         return d
-    except Exception:
+    except Exception as exc:
+        logger.warning("get_job failed for %s: %s", job_id, exc)
         return None
+
+
+def prune_old_jobs(max_age_hours: int = 24) -> int:
+    """Delete async_jobs rows not updated within the last max_age_hours.
+
+    Called at API startup to prevent unbounded table growth.
+
+    Args:
+        max_age_hours: Rows with an ``updated`` timestamp older than this are deleted.
+
+    Returns:
+        Number of rows deleted.
+    """
+    try:
+        conn = get_db()
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM async_jobs WHERE updated < datetime('now', ? || ' hours')",
+                (f"-{max_age_hours}",),
+            )
+            n = cur.rowcount
+        conn.close()
+        if n > 0:
+            logger.info("Pruned %d stale async_jobs (>%dh old)", n, max_age_hours)
+        return n
+    except Exception as exc:
+        logger.warning("prune_old_jobs failed: %s", exc)
+        return 0
 
 
 # Initialise on import

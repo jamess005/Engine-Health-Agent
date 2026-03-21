@@ -21,17 +21,16 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
+from src.core.config import PSI_MODERATE as _PSI_MODERATE, PSI_SIGNIFICANT as _PSI_SIGNIFICANT
+
 warnings.filterwarnings("ignore")
 
 logger = logging.getLogger(__name__)
-
-# PSI thresholds
-_PSI_MODERATE = 0.10
-_PSI_SIGNIFICANT = 0.25
 
 # Sensor columns to monitor (informative sensors only — same set as anomaly detector)
 _MONITOR_COLS = [
@@ -86,58 +85,89 @@ def _drift_level(psi: float) -> str:
     return "none"
 
 
-def run_drift_check(fd_id: str = "FD004") -> Dict[str, Any]:
+def run_drift_check(
+    fd_id: str = "FD004",
+    baseline_override: Optional["pd.DataFrame"] = None,
+) -> Dict[str, Any]:
     """Compute PSI for all monitored sensor features and store results to DB.
 
     Compares the test fleet distribution against the training baseline.
 
     Args:
         fd_id: Dataset identifier (default 'FD004').
+        baseline_override: Optional DataFrame to use as the reference baseline
+            instead of loading the training set.  Pass a recent window of
+            known-good data to re-baseline the monitor without retraining.
 
     Returns:
         summary dict with keys:
             features_checked, no_drift, moderate_drift, significant_drift,
             flagged (list of feature names with PSI ≥ 0.10),
-            details (list of per-feature dicts)
+            details (list of per-feature dicts with drift_direction and mean_shift)
     """
+    import pandas as pd
     from src.features.loader import load_processed
     from src.features.builder import build_features
     from src.db.database import log_drift_metrics
 
-    train_raw = load_processed(fd_id, "train")
     test_raw  = load_processed(fd_id, "test")
+    test_feat = build_features(test_raw, add_rolling=False)
 
-    train_feat = build_features(train_raw, add_rolling=False)
-    test_feat  = build_features(test_raw, train_ref=train_feat, add_rolling=False)
+    if baseline_override is not None:
+        train_feat = baseline_override
+        logger.info("run_drift_check: using caller-supplied baseline (%d rows)", len(train_feat))
+    else:
+        train_raw  = load_processed(fd_id, "train")
+        train_feat = build_features(train_raw, add_rolling=False)
 
     cols_to_check = [c for c in _MONITOR_COLS + _EXTRA_COLS if c in train_feat.columns]
+
+    missing = set(_MONITOR_COLS + _EXTRA_COLS) - set(train_feat.columns)
+    if missing:
+        logger.warning(
+            "Drift check: %d expected columns absent from features: %s",
+            len(missing), sorted(missing),
+        )
 
     rows: List[Dict] = []
     for col in cols_to_check:
         baseline = train_feat[col].dropna().values
-        current  = test_feat[col].dropna().values
+        current  = test_feat[col].dropna().values if col in test_feat.columns else np.array([])
 
         psi = compute_psi(baseline, current)
         level = _drift_level(psi)
 
+        mean_shift = float(np.nanmean(current) - np.nanmean(baseline)) if len(current) > 0 else 0.0
+        if abs(mean_shift) < 0.05:
+            drift_direction = "stable"
+        elif mean_shift > 0:
+            drift_direction = "up"
+        else:
+            drift_direction = "down"
+
         rows.append({
-            "feature":    col,
-            "condition":  None,
-            "n_test":     int(len(current)),
-            "mean_test":  float(np.nanmean(current)),
-            "std_test":   float(np.nanstd(current)),
-            "mean_train": float(np.nanmean(baseline)),
-            "std_train":  float(np.nanstd(baseline)),
-            "psi_score":  psi,
-            "drift_level": level,
+            "feature":         col,
+            "condition":       None,
+            "n_test":          int(len(current)),
+            "mean_test":       float(np.nanmean(current)) if len(current) > 0 else 0.0,
+            "std_test":        float(np.nanstd(current))  if len(current) > 0 else 0.0,
+            "mean_train":      float(np.nanmean(baseline)),
+            "std_train":       float(np.nanstd(baseline)),
+            "psi_score":       psi,
+            "drift_level":     level,
+            "drift_direction": drift_direction,
+            "mean_shift":      round(mean_shift, 4),
         })
 
-    log_drift_metrics(rows)
+    # Persist only the DB-schema fields (drift_direction/mean_shift are in-memory only)
+    log_drift_metrics([{k: v for k, v in r.items()
+                        if k not in ("drift_direction", "mean_shift")} for r in rows])
 
     flagged = [r["feature"] for r in rows if r["drift_level"] != "none"]
-    counts = {"none": 0, "moderate": 0, "significant": 0}
-    for r in rows:
-        counts[r["drift_level"]] += 1
+    counts = Counter(r["drift_level"] for r in rows)
+    counts.setdefault("none", 0)
+    counts.setdefault("moderate", 0)
+    counts.setdefault("significant", 0)
 
     if counts["significant"] > 0:
         sig_features = ", ".join(r["feature"] for r in rows if r["drift_level"] == "significant")
@@ -248,9 +278,10 @@ def get_drift_summary() -> Optional[Dict[str, Any]]:
         return None
 
     flagged = [r["feature"] for r in rows if r["drift_level"] != "none"]
-    counts = {"none": 0, "moderate": 0, "significant": 0}
-    for r in rows:
-        counts[r["drift_level"]] += 1
+    counts = Counter(r["drift_level"] for r in rows)
+    counts.setdefault("none", 0)
+    counts.setdefault("moderate", 0)
+    counts.setdefault("significant", 0)
 
     return {
         "timestamp":        rows[0]["timestamp"],
