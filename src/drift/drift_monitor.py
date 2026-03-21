@@ -87,7 +87,7 @@ def _drift_level(psi: float) -> str:
 
 def run_drift_check(
     fd_id: str = "FD004",
-    baseline_override: Optional["pd.DataFrame"] = None,
+    baseline_override: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Compute PSI for all monitored sensor features and store results to DB.
 
@@ -105,7 +105,6 @@ def run_drift_check(
             flagged (list of feature names with PSI ≥ 0.10),
             details (list of per-feature dicts with drift_direction and mean_shift)
     """
-    import pandas as pd
     from src.features.loader import load_processed
     from src.features.builder import build_features
     from src.db.database import log_drift_metrics
